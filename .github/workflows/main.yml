@@ -1,0 +1,379 @@
+name: Build New Touch APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Criar projeto Android
+        run: |
+          mkdir -p app/src/main/java/com/newtouch/app app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NewTouch"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.newtouch.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.newtouch.app'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".TouchService" android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100"/>
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">New Touch</string>
+              <string name="acc_desc">Permite ao New Touch fazer gestos de deslizar e mover a tela quando você pedir.</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/newtouch/app/TouchService.kt <<'EOF'
+          package com.newtouch.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+
+          class TouchService : AccessibilityService() {
+              companion object {
+                  @Volatile var inst: TouchService? = null
+                  @Volatile var active = false
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+              private var view: View? = null
+              private val extras = mutableListOf<View>()
+              private var looping = false
+              private val wm get() = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              private val blue = Color.parseColor("#0866FF")
+
+              override fun onServiceConnected() { inst = this }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() { stop() }
+              override fun onUnbind(i: Intent?): Boolean { stop(); inst = null; return super.onUnbind(i) }
+              override fun onDestroy() { stop(); inst = null; super.onDestroy() }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              fun start(mode: String) {
+                  stop()
+                  when (mode) {
+                      "slide" -> { active = true; showSlide() }
+                      "move" -> { active = true; showPad() }
+                  }
+              }
+
+              fun stop() {
+                  active = false
+                  looping = false
+                  h.removeCallbacksAndMessages(null)
+                  view?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  extras.forEach { try { wm.removeView(it) } catch (e: Exception) {} }
+                  extras.clear()
+                  view = null
+              }
+
+              private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, d: Long = 400) {
+                  val p = Path()
+                  p.moveTo(x1, y1)
+                  p.lineTo(x2, y2)
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, d)).build()
+                  dispatchGesture(g, null, null)
+              }
+
+              private fun circle(t: String) = Button(this).apply {
+                  text = t; textSize = 18f; setTextColor(Color.WHITE)
+                  minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
+                  setPadding(0, 0, 0, 0)
+                  background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(blue) }
+              }
+
+              private fun params() = WindowManager.LayoutParams(
+                  WindowManager.LayoutParams.WRAP_CONTENT,
+                  WindowManager.LayoutParams.WRAP_CONTENT,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                  PixelFormat.TRANSLUCENT
+              )
+
+              // Tela cheia: ponha o dedo em qualquer lugar e arraste sem soltar.
+              // O app cobre a tela com duas camadas invisíveis, deixando uma fenda fina no meio
+              // por onde ele faz o deslizar de verdade. A cada trecho que o dedo anda, sai um deslizar.
+              private fun showSlide() {
+                  val m = resources.displayMetrics
+                  val w = m.widthPixels
+                  val ht = m.heightPixels.toFloat()
+                  val gapL = w / 2 - dp(24)
+                  val gapR = w / 2 + dp(24)
+                  var lastY = 0f
+                  var lastT = 0L
+                  val onTouch = View.OnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> lastY = e.rawY
+                          MotionEvent.ACTION_MOVE -> {
+                              val dy = e.rawY - lastY
+                              if (abs(dy) > dp(45)) {
+                                  val now = System.currentTimeMillis()
+                                  if (now - lastT > 300) {
+                                      lastT = now
+                                      val x = w / 2f
+                                      if (dy < 0) swipe(x, ht * 0.75f, x, ht * 0.25f, 220)
+                                      else swipe(x, ht * 0.25f, x, ht * 0.75f, 220)
+                                  }
+                                  lastY = e.rawY
+                              }
+                          }
+                      }
+                      true
+                  }
+                  fun zone(gx: Int, width: Int) {
+                      val v = View(this)
+                      v.setOnTouchListener(onTouch)
+                      val p = WindowManager.LayoutParams(
+                          width, WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                          PixelFormat.TRANSLUCENT
+                      ).apply { gravity = Gravity.TOP or Gravity.START; x = gx }
+                      wm.addView(v, p)
+                      extras.add(v)
+                  }
+                  zone(0, gapL)
+                  zone(gapR, w - gapR)
+                  // botão pequeno para parar, no canto de cima
+                  val close = circle("✕")
+                  close.alpha = 0.55f
+                  close.setOnClickListener { stop() }
+                  val cp = WindowManager.LayoutParams(
+                      dp(40), dp(40),
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; x = dp(8); y = dp(56) }
+                  wm.addView(close, cp)
+                  extras.add(close)
+              }
+
+              // Painel com setas: cada seta faz um gesto de deslizar na tela; X para tudo
+              private fun showPad() {
+                  val m = resources.displayMetrics
+                  val w = m.widthPixels.toFloat()
+                  val ht = m.heightPixels.toFloat()
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(dp(8), dp(8), dp(8), dp(8))
+                      background = GradientDrawable().apply { setColor(Color.parseColor("#CC0B1F4D")); cornerRadius = dp(32).toFloat() }
+                  }
+                  fun add(t: String, a: () -> Unit) {
+                      val b = circle(t)
+                      b.setOnClickListener { a() }
+                      row.addView(b, LinearLayout.LayoutParams(dp(52), dp(52)).apply { setMargins(dp(4), 0, dp(4), 0) })
+                  }
+                  add("◀") { swipe(w * 0.7f, ht * 0.5f, w * 0.3f, ht * 0.5f) }
+                  add("▲") { swipe(w * 0.5f, ht * 0.7f, w * 0.5f, ht * 0.3f) }
+                  add("▼") { swipe(w * 0.5f, ht * 0.3f, w * 0.5f, ht * 0.7f) }
+                  add("▶") { swipe(w * 0.3f, ht * 0.5f, w * 0.7f, ht * 0.5f) }
+                  add("✕") { stop() }
+                  val p = params().apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(90) }
+                  wm.addView(row, p)
+                  view = row
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/newtouch/app/MainActivity.kt <<'EOF'
+          package com.newtouch.app
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private var mode = "slide"
+              private val cards = LinkedHashMap<String, Button>()
+              private lateinit var go: Button
+              private lateinit var status: TextView
+              private val blue = Color.parseColor("#0866FF")
+              private val ink = Color.parseColor("#0B1F4D")
+              private val names = mapOf("slide" to "Deslizar", "off" to "Desligar", "move" to "Mover Tela")
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun shape(fill: Int, stroke: Int = 0) = GradientDrawable().apply {
+                  setColor(fill); cornerRadius = dp(20).toFloat()
+                  if (stroke != 0) setStroke(dp(3), stroke)
+              }
+
+              private fun btn(t: String, bg: Int, fg: Int, h: Int) = Button(this).apply {
+                  text = t; isAllCaps = false; setTextColor(fg); textSize = 16f; background = shape(bg)
+                  layoutParams = LinearLayout.LayoutParams(-1, dp(h)).apply { topMargin = dp(12) }
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(40), dp(18), dp(24))
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "NEW TOUCH"; textSize = 30f; setTextColor(ink); setTypeface(null, Typeface.BOLD)
+                  })
+                  col.addView(TextView(this).apply { text = "Controle seu toque como quiser!"; setTextColor(Color.GRAY) })
+                  val desc = mapOf(
+                      "slide" to "Deslizar\nArraste o dedo em qualquer lugar da tela, sem soltar.",
+                      "off" to "Desligar\nDesative a função de toque.",
+                      "move" to "Mover Tela\nUse as setas flutuantes para mover a tela."
+                  )
+                  for ((k, v) in desc) {
+                      val c = btn(v, Color.WHITE, ink, 96)
+                      c.setOnClickListener { mode = k; TouchService.inst?.stop(); refresh() }
+                      cards[k] = c
+                      col.addView(c)
+                  }
+                  go = btn("", blue, Color.WHITE, 64)
+                  go.setOnClickListener { toggle() }
+                  col.addView(go)
+                  status = TextView(this).apply { setPadding(0, dp(14), 0, dp(6)); setTextColor(ink) }
+                  col.addView(status)
+                  val acc = btn("Abrir Acessibilidade", Color.parseColor("#DBE9FF"), blue, 52)
+                  acc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  col.addView(acc)
+                  val sos = btn("EMERGÊNCIA: parar tudo", Color.WHITE, Color.parseColor("#E5484D"), 52)
+                  sos.background = shape(Color.WHITE, Color.parseColor("#E5484D"))
+                  sos.setOnClickListener { TouchService.inst?.stop(); refresh() }
+                  col.addView(sos)
+                  val sc = ScrollView(this)
+                  sc.setBackgroundColor(Color.parseColor("#F4F8FF"))
+                  sc.addView(col)
+                  setContentView(sc)
+              }
+
+              override fun onResume() { super.onResume(); refresh() }
+
+              private fun toggle() {
+                  val s = TouchService.inst
+                  if (s == null) {
+                      Toast.makeText(this, "Ligue o New Touch em Acessibilidade", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      return
+                  }
+                  if (TouchService.active) s.stop()
+                  else if (mode == "off") { s.stop(); Toast.makeText(this, "Função de toque desligada", Toast.LENGTH_SHORT).show() }
+                  else s.start(mode)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val on = TouchService.inst != null && TouchService.active
+                  for ((k, c) in cards) c.background = if (k == mode) shape(Color.parseColor("#EAF2FF"), blue) else shape(Color.WHITE)
+                  go.text = if (on) "DESATIVAR" else "ATIVAR"
+                  status.text = when {
+                      TouchService.inst == null -> "Serviço desligado. Toque em Abrir Acessibilidade e ligue o New Touch."
+                      on -> "● Ativo: " + names[mode]
+                      else -> "Pronto. Escolha um modo e toque em Ativar."
+                  }
+              }
+          }
+          EOF
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+      - name: Publicar APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: New Touch build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
